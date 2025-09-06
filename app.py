@@ -15,16 +15,173 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
+import sys
 import warnings
 import threading
 import time
 import joblib
 from datetime import datetime, timedelta
 import schedule
+from pathlib import Path
+import glob
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app)
+
+# Dynamic path detection
+def get_dynamic_paths():
+    """Dynamically detect and set up all necessary paths from OS"""
+    paths = {}
+    
+    # Get current working directory
+    current_dir = os.getcwd()
+    paths['current_dir'] = current_dir
+    
+    # Get user home directory
+    home_dir = os.path.expanduser("~")
+    paths['home_dir'] = home_dir
+    
+    # Get script directory (where this script is located)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    paths['script_dir'] = script_dir
+    
+    # Common potential locations for Firebase credentials
+    firebase_search_paths = [
+        # Current directory
+        os.path.join(current_dir, "*.json"),
+        os.path.join(current_dir, "credentials", "*.json"),
+        os.path.join(current_dir, "config", "*.json"),
+        os.path.join(current_dir, "firebase", "*.json"),
+        
+        # Script directory
+        os.path.join(script_dir, "*.json"),
+        os.path.join(script_dir, "credentials", "*.json"),
+        os.path.join(script_dir, "config", "*.json"),
+        os.path.join(script_dir, "firebase", "*.json"),
+        
+        # Home directory
+        os.path.join(home_dir, ".firebase", "*.json"),
+        os.path.join(home_dir, ".credentials", "*.json"),
+        os.path.join(home_dir, "Documents", "firebase", "*.json"),
+        os.path.join(home_dir, "Desktop", "firebase", "*.json"),
+        
+        # System-wide locations (Unix/Linux)
+        "/etc/firebase/*.json",
+        "/opt/firebase/*.json",
+        "/usr/local/etc/firebase/*.json",
+        
+        # Common project directories
+        os.path.join(current_dir, "..", "credentials", "*.json"),
+        os.path.join(current_dir, "..", "config", "*.json"),
+    ]
+    
+    # Search for Firebase credential files
+    firebase_credentials = []
+    for search_path in firebase_search_paths:
+        try:
+            found_files = glob.glob(search_path)
+            firebase_credentials.extend(found_files)
+        except:
+            continue
+    
+    # Filter for likely Firebase service account files
+    likely_firebase_files = []
+    for file_path in firebase_credentials:
+        if os.path.isfile(file_path):
+            filename = os.path.basename(file_path).lower()
+            # Check if filename suggests it's a Firebase service account key
+            if any(keyword in filename for keyword in [
+                'firebase', 'service-account', 'serviceaccount', 
+                'credentials', 'key', 'admin', 'sdk'
+            ]):
+                likely_firebase_files.append(file_path)
+    
+    paths['firebase_credentials'] = likely_firebase_files
+    
+    # Model storage paths
+    model_storage_paths = [
+        os.path.join(current_dir, "models"),
+        os.path.join(script_dir, "models"),
+        os.path.join(home_dir, ".hospital_ai", "models"),
+        current_dir,  # fallback to current directory
+        script_dir    # fallback to script directory
+    ]
+    
+    # Create model directory if it doesn't exist
+    for model_path in model_storage_paths[:3]:  # Try the first 3 preferred locations
+        try:
+            os.makedirs(model_path, exist_ok=True)
+            if os.access(model_path, os.W_OK):  # Check if writable
+                paths['model_storage'] = model_path
+                break
+        except:
+            continue
+    
+    # If none of the preferred locations work, use current directory
+    if 'model_storage' not in paths:
+        paths['model_storage'] = current_dir
+    
+    # Data storage paths
+    data_storage_paths = [
+        os.path.join(current_dir, "data"),
+        os.path.join(script_dir, "data"), 
+        os.path.join(home_dir, ".hospital_ai", "data"),
+        current_dir,  # fallback
+        script_dir    # fallback
+    ]
+    
+    for data_path in data_storage_paths[:3]:
+        try:
+            os.makedirs(data_path, exist_ok=True)
+            if os.access(data_path, os.W_OK):
+                paths['data_storage'] = data_path
+                break
+        except:
+            continue
+    
+    if 'data_storage' not in paths:
+        paths['data_storage'] = current_dir
+    
+    # Log storage paths
+    log_storage_paths = [
+        os.path.join(current_dir, "logs"),
+        os.path.join(script_dir, "logs"),
+        os.path.join(home_dir, ".hospital_ai", "logs"),
+        current_dir,  # fallback
+        script_dir    # fallback
+    ]
+    
+    for log_path in log_storage_paths[:3]:
+        try:
+            os.makedirs(log_path, exist_ok=True)
+            if os.access(log_path, os.W_OK):
+                paths['log_storage'] = log_path
+                break
+        except:
+            continue
+    
+    if 'log_storage' not in paths:
+        paths['log_storage'] = current_dir
+    
+    # Environment-specific paths
+    if sys.platform.startswith('win'):
+        # Windows-specific paths
+        paths['temp_dir'] = os.environ.get('TEMP', os.path.join(home_dir, 'AppData', 'Local', 'Temp'))
+        paths['app_data'] = os.environ.get('APPDATA', os.path.join(home_dir, 'AppData', 'Roaming'))
+    else:
+        # Unix/Linux/Mac paths
+        paths['temp_dir'] = os.environ.get('TMPDIR', '/tmp')
+        paths['app_data'] = os.path.join(home_dir, '.local', 'share')
+    
+    # Python environment paths
+    paths['python_executable'] = sys.executable
+    paths['python_path'] = sys.path
+    
+    return paths
+
+# Initialize dynamic paths
+DYNAMIC_PATHS = get_dynamic_paths()
 
 # Global variables
 model = None
@@ -40,19 +197,57 @@ last_training_time = None
 db = None
 training_lock = threading.Lock()
 
-# Firebase initialization
+def print_detected_paths():
+    """Print all detected paths for debugging"""
+    print("=== DETECTED SYSTEM PATHS ===")
+    print(f"Current Directory: {DYNAMIC_PATHS['current_dir']}")
+    print(f"Script Directory: {DYNAMIC_PATHS['script_dir']}")
+    print(f"Home Directory: {DYNAMIC_PATHS['home_dir']}")
+    print(f"Model Storage: {DYNAMIC_PATHS['model_storage']}")
+    print(f"Data Storage: {DYNAMIC_PATHS['data_storage']}")
+    print(f"Log Storage: {DYNAMIC_PATHS['log_storage']}")
+    print(f"Temp Directory: {DYNAMIC_PATHS['temp_dir']}")
+    print(f"App Data: {DYNAMIC_PATHS['app_data']}")
+    print(f"Python Executable: {DYNAMIC_PATHS['python_executable']}")
+    
+    if DYNAMIC_PATHS['firebase_credentials']:
+        print(f"Found Firebase Credentials:")
+        for i, cred_path in enumerate(DYNAMIC_PATHS['firebase_credentials'], 1):
+            print(f"  {i}. {cred_path}")
+    else:
+        print("No Firebase credential files found in common locations")
+    
+    print("=" * 50)
+
+# Firebase initialization with dynamic path detection
 def initialize_firebase():
-    """Initialize Firebase connection"""
+    """Initialize Firebase connection using detected paths"""
     global db
     try:
-        # Initialize Firebase (you'll need to provide your own service account key)
         if not firebase_admin._apps:
-            # Replace with your Firebase service account key path
-            cred = credentials.Certificate("path/to/your/firebase-service-account-key.json")
-            firebase_admin.initialize_app(cred)
+            firebase_cred_path = None
+            
+            # Try to find Firebase credentials
+            if DYNAMIC_PATHS['firebase_credentials']:
+                # Use the first found credential file
+                firebase_cred_path = DYNAMIC_PATHS['firebase_credentials'][0]
+                print(f"Using Firebase credentials: {firebase_cred_path}")
+            else:
+                # Check environment variables
+                if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
+                    firebase_cred_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
+                    print(f"Using Firebase credentials from environment: {firebase_cred_path}")
+            
+            if firebase_cred_path and os.path.exists(firebase_cred_path):
+                cred = credentials.Certificate(firebase_cred_path)
+                firebase_admin.initialize_app(cred)
+                print(f"Firebase initialized successfully with: {firebase_cred_path}")
+            else:
+                print("No Firebase credentials found, using synthetic data fallback")
+                return False
         
         db = firestore.client()
-        print("Firebase initialized successfully")
+        print("Firebase Firestore client initialized successfully")
         return True
     except Exception as e:
         print(f"Firebase initialization failed: {e}")
@@ -527,8 +722,10 @@ def train_ensemble_model(use_firebase=True):
         return ensemble, accuracy
 
 def save_model(model_obj):
-    """Save trained model and preprocessors"""
+    """Save trained model and preprocessors using dynamic paths"""
     try:
+        model_file_path = os.path.join(DYNAMIC_PATHS['model_storage'], 'hospital_readmission_model.pkl')
+        
         model_data = {
             'model': model_obj,
             'label_encoders': label_encoders,
@@ -539,22 +736,43 @@ def save_model(model_obj):
             'numerical_columns': numerical_columns,
             'original_feature_names': original_feature_names,
             'accuracy': model_accuracy,
-            'training_time': last_training_time
+            'training_time': last_training_time,
+            'dynamic_paths': DYNAMIC_PATHS
         }
         
-        joblib.dump(model_data, 'hospital_readmission_model.pkl')
-        print("Model saved successfully")
+        joblib.dump(model_data, model_file_path)
+        print(f"Model saved successfully to: {model_file_path}")
+        
+        # Also save backup in script directory
+        backup_path = os.path.join(DYNAMIC_PATHS['script_dir'], 'hospital_readmission_model_backup.pkl')
+        try:
+            joblib.dump(model_data, backup_path)
+            print(f"Model backup saved to: {backup_path}")
+        except Exception as backup_error:
+            print(f"Warning: Could not save backup model: {backup_error}")
+            
     except Exception as e:
         print(f"Error saving model: {e}")
 
 def load_model():
-    """Load saved model and preprocessors"""
+    """Load saved model and preprocessors using dynamic paths"""
     global model, label_encoders, scaler, imputer, feature_selector, feature_columns
     global numerical_columns, original_feature_names, model_accuracy, last_training_time
     
     try:
-        if os.path.exists('hospital_readmission_model.pkl'):
-            model_data = joblib.load('hospital_readmission_model.pkl')
+        # Try primary model location
+        model_file_path = os.path.join(DYNAMIC_PATHS['model_storage'], 'hospital_readmission_model.pkl')
+        
+        if not os.path.exists(model_file_path):
+            # Try backup location
+            model_file_path = os.path.join(DYNAMIC_PATHS['script_dir'], 'hospital_readmission_model_backup.pkl')
+        
+        if not os.path.exists(model_file_path):
+            # Try current directory as last resort
+            model_file_path = 'hospital_readmission_model.pkl'
+        
+        if os.path.exists(model_file_path):
+            model_data = joblib.load(model_file_path)
             
             model = model_data['model']
             label_encoders = model_data['label_encoders']
@@ -567,33 +785,52 @@ def load_model():
             model_accuracy = model_data['accuracy']
             last_training_time = model_data.get('training_time')
             
-            print(f"Model loaded successfully. Accuracy: {model_accuracy:.2%}")
+            print(f"Model loaded successfully from: {model_file_path}")
+            print(f"Model Accuracy: {model_accuracy:.2%}")
             return True
     except Exception as e:
         print(f"Error loading model: {e}")
     
     return False
 
+def save_logs(message, log_type="INFO"):
+    """Save logs to dynamic log directory"""
+    try:
+        log_file_path = os.path.join(DYNAMIC_PATHS['log_storage'], 'hospital_ai.log')
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [{log_type}] {message}\n"
+        
+        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+            log_file.write(log_entry)
+    except Exception as e:
+        print(f"Warning: Could not save log: {e}")
+
 def retrain_model_periodically():
     """Retrain model with new Firebase data"""
     print("Checking for model retraining...")
+    save_logs("Checking for model retraining", "INFO")
     
     if db is None:
         print("Firebase not available, skipping retraining")
+        save_logs("Firebase not available, skipping retraining", "WARNING")
         return
     
     if last_training_time:
         time_since_training = datetime.now() - last_training_time
         if time_since_training < timedelta(hours=1):
             print("Model was recently trained, skipping")
+            save_logs("Model was recently trained, skipping", "INFO")
             return
     
     print("Starting scheduled model retraining...")
+    save_logs("Starting scheduled model retraining", "INFO")
     try:
         train_ensemble_model(use_firebase=True)
         print("Scheduled retraining completed successfully")
+        save_logs("Scheduled retraining completed successfully", "INFO")
     except Exception as e:
         print(f"Error during scheduled retraining: {e}")
+        save_logs(f"Error during scheduled retraining: {e}", "ERROR")
 
 # Schedule periodic retraining
 schedule.every(6).hours.do(retrain_model_periodically)
@@ -613,6 +850,7 @@ def predict():
         
         input_data = request.json
         print(f"Received prediction request: {input_data}")
+        save_logs(f"Prediction request received: {input_data}", "INFO")
         
         # Create DataFrame from input
         df = pd.DataFrame([input_data])
@@ -677,10 +915,12 @@ def predict():
         }
         
         print(f"Prediction result: {result}")
+        save_logs(f"Prediction completed: {result}", "INFO")
         return jsonify(result)
         
     except Exception as e:
         print(f"Error in prediction: {str(e)}")
+        save_logs(f"Error in prediction: {str(e)}", "ERROR")
         import traceback
         traceback.print_exc()
         return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
@@ -690,18 +930,23 @@ def retrain_model():
     """Manual model retraining endpoint"""
     try:
         print("Manual retraining triggered")
+        save_logs("Manual retraining triggered", "INFO")
         model_obj, accuracy = train_ensemble_model(use_firebase=True)
         
-        return jsonify({
+        result = {
             'status': 'success',
             'message': 'Model retrained successfully',
             'new_accuracy': f"{accuracy:.2%}",
             'training_time': last_training_time.isoformat() if last_training_time else None
-        })
+        }
+        save_logs(f"Manual retraining completed: {result}", "INFO")
+        return jsonify(result)
     except Exception as e:
+        error_msg = f'Retraining failed: {str(e)}'
+        save_logs(error_msg, "ERROR")
         return jsonify({
             'status': 'error',
-            'message': f'Retraining failed: {str(e)}'
+            'message': error_msg
         }), 500
 
 @app.route('/model-info', methods=['GET'])
@@ -720,7 +965,23 @@ def model_info():
         'last_training': last_training_time.isoformat() if last_training_time else None,
         'data_source': 'Firebase + Synthetic',
         'auto_retrain': True,
-        'retrain_interval': '6 hours'
+        'retrain_interval': '6 hours',
+        'model_storage_path': DYNAMIC_PATHS['model_storage'],
+        'data_storage_path': DYNAMIC_PATHS['data_storage'],
+        'log_storage_path': DYNAMIC_PATHS['log_storage']
+    })
+
+@app.route('/system-info', methods=['GET'])
+def system_info():
+    """Get system and path information"""
+    return jsonify({
+        'detected_paths': DYNAMIC_PATHS,
+        'firebase_credentials_found': len(DYNAMIC_PATHS['firebase_credentials']),
+        'firebase_connected': db is not None,
+        'platform': sys.platform,
+        'python_version': sys.version,
+        'working_directory': os.getcwd(),
+        'script_location': os.path.abspath(__file__)
     })
 
 @app.route('/health', methods=['GET'])
@@ -731,14 +992,17 @@ def health_check():
         'firebase_connected': db is not None,
         'accuracy': f"{model_accuracy:.2%}" if model else "N/A",
         'last_training': last_training_time.isoformat() if last_training_time else None,
-        'data_records': 'Firebase integrated'
+        'data_records': 'Firebase integrated',
+        'paths_configured': True,
+        'model_storage': DYNAMIC_PATHS['model_storage'],
+        'firebase_credentials': len(DYNAMIC_PATHS['firebase_credentials'])
     })
 
 @app.route('/data-stats', methods=['GET'])
 def data_stats():
     """Get statistics about the training data"""
     try:
-        # Check if Firebase is available instead of using undefined variable
+        # Check if Firebase is available
         if db is not None:
             df = fetch_firebase_data()
         else:
@@ -757,7 +1021,8 @@ def data_stats():
                 'data_quality': {
                     'missing_values': df.isnull().sum().sum(),
                     'complete_records': len(df) - df.isnull().any(axis=1).sum()
-                }
+                },
+                'data_source': 'Firebase' if db is not None else 'Synthetic'
             }
         else:
             stats = {'error': 'Target column not found'}
@@ -766,20 +1031,59 @@ def data_stats():
     except Exception as e:
         return jsonify({'error': f'Failed to get data stats: {str(e)}'}), 500
 
+@app.route('/logs', methods=['GET'])
+def get_logs():
+    """Get recent logs"""
+    try:
+        log_file_path = os.path.join(DYNAMIC_PATHS['log_storage'], 'hospital_ai.log')
+        if os.path.exists(log_file_path):
+            with open(log_file_path, 'r', encoding='utf-8') as log_file:
+                logs = log_file.readlines()
+                # Return last 50 lines
+                recent_logs = logs[-50:] if len(logs) > 50 else logs
+                return jsonify({
+                    'logs': [log.strip() for log in recent_logs],
+                    'log_file_path': log_file_path,
+                    'total_lines': len(logs)
+                })
+        else:
+            return jsonify({
+                'logs': [],
+                'message': 'No log file found',
+                'log_file_path': log_file_path
+            })
+    except Exception as e:
+        return jsonify({'error': f'Failed to read logs: {str(e)}'}), 500
+
 if __name__ == "__main__":
-    print("Starting Advanced Hospital Readmission Prediction API with Firebase Integration...")
+    print("=" * 80)
+    print("STARTING ADVANCED HOSPITAL READMISSION PREDICTION API")
+    print("WITH DYNAMIC PATH DETECTION AND FIREBASE INTEGRATION")
+    print("=" * 80)
+    
+    # Print all detected paths for debugging
+    print_detected_paths()
+    
+    # Initialize logging
+    save_logs("Application starting up", "INFO")
+    save_logs(f"Detected paths: {DYNAMIC_PATHS}", "INFO")
     
     # Initialize Firebase
     firebase_available = initialize_firebase()
+    save_logs(f"Firebase initialization: {'Success' if firebase_available else 'Failed'}", 
+              "INFO" if firebase_available else "WARNING")
     
     # Try to load existing model
     if not load_model():
         print("Training new model...")
+        save_logs("Training new model", "INFO")
         try:
             train_ensemble_model(use_firebase=firebase_available)
         except Exception as e:
             print(f"Training failed: {e}")
+            save_logs(f"Training failed: {e}", "ERROR")
             print("Creating fallback model with synthetic data...")
+            save_logs("Creating fallback model with synthetic data", "WARNING")
             train_ensemble_model(use_firebase=False)
     
     # Start scheduler thread for periodic retraining
@@ -787,7 +1091,28 @@ if __name__ == "__main__":
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
         print("Auto-retraining scheduler started")
+        save_logs("Auto-retraining scheduler started", "INFO")
     
-    print(f"Model initialization complete! Accuracy: {model_accuracy:.2%}")
-    print("Starting Flask server...")
+    print(f"\n🎯 Model initialization complete! Accuracy: {model_accuracy:.2%}")
+    print(f"📁 Model stored in: {DYNAMIC_PATHS['model_storage']}")
+    print(f"📊 Data stored in: {DYNAMIC_PATHS['data_storage']}")
+    print(f"📝 Logs stored in: {DYNAMIC_PATHS['log_storage']}")
+    print(f"🔥 Firebase: {'Connected' if firebase_available else 'Not Connected'}")
+    
+    if DYNAMIC_PATHS['firebase_credentials']:
+        print(f"🔑 Firebase credentials found: {len(DYNAMIC_PATHS['firebase_credentials'])} files")
+    else:
+        print("⚠️  No Firebase credentials found in common locations")
+        print("   Please ensure your firebase-service-account-key.json is in one of these locations:")
+        print("   - Current directory")
+        print("   - ./credentials/")
+        print("   - ./config/")
+        print("   - ./firebase/")
+        print("   Or set GOOGLE_APPLICATION_CREDENTIALS environment variable")
+    
+    print("\n" + "=" * 80)
+    print("🚀 STARTING FLASK SERVER...")
+    print("=" * 80)
+    
+    save_logs("Flask server starting", "INFO")
     app.run(debug=True, host='0.0.0.0', port=8000)
